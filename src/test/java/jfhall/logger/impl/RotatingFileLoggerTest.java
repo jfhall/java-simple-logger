@@ -1,7 +1,11 @@
 package jfhall.logger.impl;
 
+import java.io.BufferedReader;
 import java.io.File;
+import java.io.FileNotFoundException;
+import java.io.FileReader;
 import java.io.IOException;
+import java.nio.file.FileSystems;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
@@ -12,17 +16,24 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
+import java.util.stream.Collectors;
 import jfhall.logger.EntrySerializer;
 import jfhall.logger.RotationGranularity;
+import lombok.Value;
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
 import org.mockito.Mockito;
 
 // This is more of just a skeleton for the tests thrown together to get this up for review, an
 // actualy test suite needs to be set up here.
 public class RotatingFileLoggerTest {
+  private static final String RECORD_PREFIX = "{\"name\": \"";
+  private static final String RECORD_SUFFIX = "\"}";
   private static final String FILE_PREFIX = "simple-logger-test";
   private static final String FILE_NAME_TPL = "'test.log-'u'-'M'-'d'-'H'-'m";
   private static final DateTimeFormatter FILE_NAME_FORMATTER =
@@ -75,6 +86,22 @@ public class RotatingFileLoggerTest {
   }
 
   @Test
+  public void testDelayRoundsToNearestTimeUnit() {
+    final ArgumentCaptor<Long> delayCaptor = ArgumentCaptor.forClass(Long.class);
+    final ArgumentCaptor<Long> periodCaptor = ArgumentCaptor.forClass(Long.class);
+    Mockito.verify(this.mockExecutor)
+        .scheduleAtFixedRate(
+            Mockito.any(),
+            delayCaptor.capture(),
+            periodCaptor.capture(),
+            Mockito.eq(TimeUnit.SECONDS));
+
+    Assertions.assertEquals(7, delayCaptor.getValue());
+    Assertions.assertEquals(
+        RotationGranularity.MINUTE.getAmountOfSeconds(), periodCaptor.getValue());
+  }
+
+  @Test
   public void testFileGetsCreatedDuringRollover() {
     for (int i = 0; i < 1_000; i++) {
       this.logger.write(createTestObject(0, "entry_0_" + i));
@@ -100,14 +127,32 @@ public class RotatingFileLoggerTest {
   }
 
   private void validateTestObjects() {
-    // do nothing atm
+    Assertions.assertFalse(this.testObjectsByFile.isEmpty(), "No test data written to verify.");
+
+    try {
+      for (final Map.Entry<String, List<TestObject>> entry : this.testObjectsByFile.entrySet()) {
+        final List<TestObject> fileData =
+            new BufferedReader(new FileReader(entry.getKey()))
+                .lines()
+                .map(this::deserialize)
+                .collect(Collectors.toList());
+
+        Assertions.assertEquals(entry.getValue().size(), fileData.size());
+
+        for (int i = 0; i < fileData.size(); i++) {
+          Assertions.assertEquals(entry.getValue().get(i), fileData.get(i));
+        }
+      }
+    } catch (final FileNotFoundException e) {
+      throw new RuntimeException("Test file not found.", e);
+    }
   }
 
   private TestObject createTestObject(final int index, final String name) {
     final TestObject obj = new TestObject(name);
 
     final List<TestObject> objs =
-        this.testObjectsByFile.getOrDefault(getCurrentFilePath(index), new ArrayList<>());
+        this.testObjectsByFile.computeIfAbsent(getCurrentFilePath(index), __ -> new ArrayList<>());
 
     objs.add(obj);
 
@@ -115,14 +160,28 @@ public class RotatingFileLoggerTest {
   }
 
   private String getCurrentFilePath(final int index) {
-    // TODO make OS independent
-    return FILE_PREFIX + "/" + FILE_NAME_FORMATTER.format(nows.get(index));
+    return FileSystems.getDefault()
+        .getPath(FILE_PREFIX, FILE_NAME_FORMATTER.format(nows.get(index)))
+        .toString();
   }
 
   private String serialize(final TestObject object) {
-    return "{\"name\": \"" + object.name + "\"}";
+    return RECORD_PREFIX + object.name + RECORD_SUFFIX;
   }
 
+  private TestObject deserialize(final String testObjectString) {
+    Assertions.assertTrue(
+        testObjectString.startsWith(RECORD_PREFIX),
+        "Invalid testObjectString: " + testObjectString);
+    Assertions.assertTrue(
+        testObjectString.endsWith(RECORD_SUFFIX), "Invalid testObjectString: " + testObjectString);
+
+    return new TestObject(
+        testObjectString.substring(
+            RECORD_PREFIX.length(), testObjectString.length() - RECORD_SUFFIX.length()));
+  }
+
+  @Value
   private static class TestObject {
     private final String name;
 

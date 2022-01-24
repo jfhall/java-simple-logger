@@ -1,18 +1,21 @@
 package jfhall.logger.impl;
 
-import java.io.BufferedOutputStream;
 import java.io.File;
-import java.io.FileOutputStream;
 import java.io.IOException;
-import java.io.OutputStream;
 import java.io.UncheckedIOException;
+import java.nio.ByteBuffer;
+import java.nio.channels.AsynchronousFileChannel;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.FileSystems;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Supplier;
 import jfhall.logger.EntrySerializer;
 import jfhall.logger.RotationGranularity;
@@ -20,9 +23,7 @@ import jfhall.logger.SimpleLogger;
 
 /** A SimpleLogger that will write to a physical file, rotating to a new file at a set interval. */
 public class RotatingFileLogger<T> implements SimpleLogger<T> {
-  // OutputStream is chosen for simplicity, but something like AsynchronousFileChannel may be a
-  // better approach to avoid impacting the publishing thread.
-  private volatile OutputStream output;
+  private volatile AsyncOutput output;
 
   private final String filePrefix;
   private final DateTimeFormatter fileNameFormatter;
@@ -118,7 +119,10 @@ public class RotatingFileLogger<T> implements SimpleLogger<T> {
 
     // Set up a job to rotate the log file.
     this.executor.scheduleAtFixedRate(
-        this::rotate, calculateInitialDelay(now), 60_000, TimeUnit.MILLISECONDS);
+        this::rotate,
+        calculateInitialDelay(now),
+        rotationGranularity.getAmountOfSeconds(),
+        TimeUnit.SECONDS);
 
     initializeOutput(now);
   }
@@ -126,12 +130,8 @@ public class RotatingFileLogger<T> implements SimpleLogger<T> {
   /** {@inheritDoc}. */
   @Override
   public void write(final T input) {
-    try {
-      final String content = String.format("%s%n", this.serializer.serialize(input));
-      this.output.write(content.getBytes(StandardCharsets.UTF_8));
-    } catch (final IOException e) {
-      throw new UncheckedIOException("Failed to close simple logger file channel.", e);
-    }
+    final String content = String.format("%s%n", this.serializer.serialize(input));
+    this.output.write(ByteBuffer.wrap(content.getBytes(StandardCharsets.UTF_8)));
   }
 
   /**
@@ -140,27 +140,16 @@ public class RotatingFileLogger<T> implements SimpleLogger<T> {
    * <p>VisibleForTesting
    */
   void rotate() {
-    final OutputStream oldOutput = this.output;
+    final AsyncOutput oldOutput = this.output;
 
     initializeOutput(instantSupplier.get());
 
-    try {
-      oldOutput.close();
-    } catch (final IOException e) {
-      throw new UncheckedIOException("Failed to close simple logger file channel.", e);
-    }
+    oldOutput.close();
   }
 
   /** Initialize the output stream resources. */
   private void initializeOutput(final Instant now) {
-    try {
-      // TODO this buffer size needs to be tuned.
-      this.output =
-          new BufferedOutputStream(
-              new FileOutputStream(new File(this.filePrefix, getFileName(now))));
-    } catch (final IOException e) {
-      throw new UncheckedIOException("Failed to create simple logger file channel.", e);
-    }
+    this.output = new AsyncOutput(this.filePrefix, getFileName(now));
   }
 
   /**
@@ -173,8 +162,8 @@ public class RotatingFileLogger<T> implements SimpleLogger<T> {
   private long calculateInitialDelay(final Instant now) {
     return now.plus(1, this.rotationGranularity.getTemporalUnit())
             .truncatedTo(this.rotationGranularity.getTemporalUnit())
-            .toEpochMilli()
-        - now.toEpochMilli();
+            .getEpochSecond()
+        - now.getEpochSecond();
   }
 
   /**
@@ -186,5 +175,40 @@ public class RotatingFileLogger<T> implements SimpleLogger<T> {
    */
   private String getFileName(final Instant now) {
     return this.fileNameFormatter.format(now);
+  }
+
+  /**
+   * A wrapper for an AsynchronousFileChannel that tracks its position when writing. This will
+   * create the file when the class is created, even if there is never data written to the file.
+   * THIS MAY OVERWRITE DATA WHEN APPENDING: if the file already exists, this class will attempt to
+   * start appending to the end, but any data actively being written to the file when it is opened
+   * here may get overwritten -- data that was written before class instantiation should be fine.
+   */
+  private static class AsyncOutput {
+    private final AsynchronousFileChannel channel;
+    private final AtomicLong position;
+
+    public AsyncOutput(final String firstFilePart, final String... remainingFilePath) {
+      try {
+        final Path path = FileSystems.getDefault().getPath(firstFilePart, remainingFilePath);
+        this.channel =
+            AsynchronousFileChannel.open(path, StandardOpenOption.CREATE, StandardOpenOption.WRITE);
+        this.position = new AtomicLong(path.toFile().length());
+      } catch (final IOException e) {
+        throw new UncheckedIOException("Failed to create simple logger file channel.", e);
+      }
+    }
+
+    public void write(final ByteBuffer buffer) {
+      this.channel.write(buffer, this.position.getAndAdd(buffer.array().length));
+    }
+
+    public void close() {
+      try {
+        this.channel.close();
+      } catch (final IOException e) {
+        throw new UncheckedIOException("Failed to close simple logger file channel.", e);
+      }
+    }
   }
 }
