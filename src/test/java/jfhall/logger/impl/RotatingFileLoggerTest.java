@@ -65,7 +65,7 @@ public class RotatingFileLoggerTest {
     Mockito.when(this.mockInstantSupplier.get()).thenReturn(nows.get(0));
 
     Mockito.when(this.mockSerializer.serialize(Mockito.any()))
-        .thenAnswer(invok -> serialize(invok.getArgumentAt(0, TestObject.class)));
+        .thenAnswer(invok -> serialize(invok.getArgument(0, TestObject.class)));
 
     this.logger =
         new RotatingFileLogger<TestObject>(
